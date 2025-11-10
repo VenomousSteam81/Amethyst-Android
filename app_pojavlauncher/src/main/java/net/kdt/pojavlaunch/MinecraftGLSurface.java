@@ -1,6 +1,7 @@
 package net.kdt.pojavlaunch;
 
 import static net.kdt.pojavlaunch.MainActivity.touchCharInput;
+import static net.kdt.pojavlaunch.prefs.LauncherPreferences.PREF_MOUSE_GRAB_FORCE;
 import static net.kdt.pojavlaunch.utils.MCOptionUtils.getMcScale;
 import static org.lwjgl.glfw.CallbackBridge.sendMouseButton;
 import static org.lwjgl.glfw.CallbackBridge.windowHeight;
@@ -13,6 +14,7 @@ import android.graphics.SurfaceTexture;
 import android.os.Build;
 import android.util.AttributeSet;
 import android.util.Log;
+import android.view.Display;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -39,8 +41,12 @@ import net.kdt.pojavlaunch.customcontrols.mouse.TouchEventProcessor;
 import net.kdt.pojavlaunch.prefs.LauncherPreferences;
 import net.kdt.pojavlaunch.utils.JREUtils;
 import net.kdt.pojavlaunch.utils.MCOptionUtils;
+import net.kdt.pojavlaunch.utils.TouchControllerUtils;
 
+import org.libsdl.app.SDLActivity;
+import org.libsdl.app.SDLControllerManager;
 import org.lwjgl.glfw.CallbackBridge;
+
 
 import fr.spse.gamepad_remapper.GamepadHandler;
 import fr.spse.gamepad_remapper.RemapperManager;
@@ -77,12 +83,14 @@ public class MinecraftGLSurface extends View implements GrabListener, DirectGame
     final Object mSurfaceReadyListenerLock = new Object();
     /* View holding the surface, either a SurfaceView or a TextureView */
     View mSurface;
+    String TAG = "MinecraftGLSurface";
 
     private final InGameEventProcessor mIngameProcessor = new InGameEventProcessor(mSensitivityFactor);
     private final InGUIEventProcessor mInGUIProcessor = new InGUIEventProcessor();
     private TouchEventProcessor mCurrentTouchProcessor = mInGUIProcessor;
     private AndroidPointerCapture mPointerCapture;
     private boolean mLastGrabState = false;
+    public static boolean sdlEnabled = false;
 
     public MinecraftGLSurface(Context context) {
         this(context, null);
@@ -92,6 +100,7 @@ public class MinecraftGLSurface extends View implements GrabListener, DirectGame
         super(context, attributeSet);
         setFocusable(true);
         CallbackBridge.setDirectGamepadEnableHandler(this);
+        SDLControllerManager.setDirectGamepadEnableHandler(this);
     }
 
     @RequiresApi(api = Build.VERSION_CODES.O)
@@ -192,6 +201,13 @@ public class MinecraftGLSurface extends View implements GrabListener, DirectGame
             if(toolType == MotionEvent.TOOL_TYPE_MOUSE) {
                 if(Tools.isAndroid8OrHigher() &&
                         mPointerCapture != null) {
+                    // Can't handleAutomaticCapture if mouse isn't captured
+                    if (!CallbackBridge.isGrabbing() // Only capture if not in menu and user said so
+                            && !PREF_MOUSE_GRAB_FORCE) {
+                        // This returns true but we really can't consume this.
+                        // Else we don't receive ACTION_MOVE
+                        return !dispatchGenericMotionEvent(e);
+                    }
                     mPointerCapture.handleAutomaticCapture();
                     return true;
                 }
@@ -202,16 +218,17 @@ public class MinecraftGLSurface extends View implements GrabListener, DirectGame
             CallbackBridge.sendCursorPos(   e.getX(i) * LauncherPreferences.PREF_SCALE_FACTOR, e.getY(i) * LauncherPreferences.PREF_SCALE_FACTOR);
             return true; //mouse event handled successfully
         }
+        TouchControllerUtils.processTouchEvent(e, this);
         if (mIngameProcessor == null || mInGUIProcessor == null) return true;
         return mCurrentTouchProcessor.processTouchEvent(e);
     }
 
     private void createGamepad(View contextView, InputDevice inputDevice) {
-        if(CallbackBridge.sGamepadDirectInput) {
+        if(CallbackBridge.sGamepadDirectInput && !sdlEnabled) {
             mGamepadHandler = new DirectGamepad();
-        }else {
+        }else if(!sdlEnabled) {
             mGamepadHandler = new Gamepad(contextView, inputDevice, DefaultDataProvider.INSTANCE, true);
-        }
+        }else mGamepadHandler = (code, value) -> {}; // Ensure it isn't null while also not processing the events.
     }
 
     /**
@@ -220,9 +237,18 @@ public class MinecraftGLSurface extends View implements GrabListener, DirectGame
     @SuppressLint("NewApi")
     @Override
     public boolean dispatchGenericMotionEvent(MotionEvent event) {
+        if(sdlEnabled && Gamepad.isGamepadEvent(event)) {
+            try {
+                MainActivity.motionListener.onGenericMotion(this, event);
+                return true;
+            } catch (Throwable ignored){
+                Log.e(TAG, "SDL failed to send motionevent!");
+            }
+        }
+        super.dispatchGenericMotionEvent(event);
         int mouseCursorIndex = -1;
 
-        if(Gamepad.isGamepadEvent(event)){
+        if(!sdlEnabled && Gamepad.isGamepadEvent(event)){
             if(mGamepadHandler == null) createGamepad(this, event.getDevice());
 
             mInputManager.handleMotionEventInput(getContext(), event, mGamepadHandler);
@@ -239,9 +265,9 @@ public class MinecraftGLSurface extends View implements GrabListener, DirectGame
 
         // Make sure we grabbed the mouse if necessary
         updateGrabState(CallbackBridge.isGrabbing());
-
         switch(event.getActionMasked()) {
             case MotionEvent.ACTION_HOVER_MOVE:
+            case MotionEvent.ACTION_MOVE:
                 CallbackBridge.mouseX = (event.getX(mouseCursorIndex) * LauncherPreferences.PREF_SCALE_FACTOR);
                 CallbackBridge.mouseY = (event.getY(mouseCursorIndex) * LauncherPreferences.PREF_SCALE_FACTOR);
                 CallbackBridge.sendCursorPos(CallbackBridge.mouseX, CallbackBridge.mouseY);
@@ -293,8 +319,18 @@ public class MinecraftGLSurface extends View implements GrabListener, DirectGame
                 return true;
             }
         }
-
-        if(Gamepad.isGamepadEvent(event)){
+        // Android bundles in garbage KeyEvents for compatibility with old apps
+        // that don't have controller code so we are, checking for em.
+        boolean isGamepadEvent = Gamepad.isGamepadEvent(event);
+        if (sdlEnabled && isGamepadEvent) {
+                try {
+                    SDLActivity.handleKeyEvent(this, eventKeycode, event, null);
+                    return true;
+                } catch (Throwable ignored){
+                    Log.e(TAG, "SDL failed to send keyevent!");
+                }
+            }
+        if(!sdlEnabled && isGamepadEvent){
             if(mGamepadHandler == null) createGamepad(this, event.getDevice());
 
             mInputManager.handleKeyEventInput(getContext(), event, mGamepadHandler);
@@ -378,6 +414,14 @@ public class MinecraftGLSurface extends View implements GrabListener, DirectGame
         // Initial size set. Request immedate refresh, otherwise the initial width and height for the game
         // may be broken/unknown.
         refreshSize(true);
+        // Ensures we run at correct refresh rate (should also NOT change the resolution being used)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            float maxHz = 120f; // Set to 120 by default just to be safe
+            for (float altHz : getDisplay().getMode().getAlternativeRefreshRates()) {
+                maxHz = Math.max(maxHz, altHz);
+            }
+            surface.setFrameRate(maxHz, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT, Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS);
+        }
 
         //Load Minecraft options:
         MCOptionUtils.set("fullscreen", "off");
